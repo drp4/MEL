@@ -1,10 +1,12 @@
 import os
 import numpy as np
-from scipy.io import loadmat
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.model_selection import KFold
 from time import time
 import csv
+
+# Default data directory for Kaggle
+DATA_DIR = '/kaggle/input/datasets/eminz132/dataset/Datasets_part1'
 
 # ── Fitness / KNN helpers (identical to MEL.py) ─────────────────────────────
 
@@ -434,10 +436,25 @@ def jMultiTaskPSO_EMDO(feat, label, opts):
 
 # ── Training / saving helpers ────────────────────────────────────────────────
 
-def Training_EMDO(p_name, i):
+def Training_EMDO(p_name, i, data_dir=None):
+    if data_dir is None:
+        data_dir = DATA_DIR
     start_time = time()
     np.seterr(all='ignore')
-    traindata = loadmat(os.path.join('data', f'{p_name}.mat'))[p_name]
+    filepath = os.path.join(data_dir, f'{p_name}.txt')
+    try:
+        traindata = np.loadtxt(filepath, delimiter='\t')
+    except (OSError, ValueError):
+        try:
+            traindata = np.genfromtxt(filepath, delimiter=None)
+        except (OSError, ValueError):
+            try:
+                traindata = np.loadtxt(filepath, delimiter=',')
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Failed to load dataset '{p_name}' from '{filepath}'. "
+                    "Tried tab, whitespace, and comma delimiters."
+                ) from exc
     feat = traindata[:, :-1]
     label = traindata[:, -1]
 
@@ -489,17 +506,19 @@ def saveResults_EMDO(results):
         })
 
 
-def main_emdo():
-    os.system('clear')
-    os.system('cls')
-    os.system('close')
+def main_emdo(data_dir=None, problems=None):
+    if data_dir is None:
+        data_dir = DATA_DIR
+    if problems is None:
+        problems = ['Adenoma', 'ALL_AML', 'ALL1', 'ALL2', 'ALL3', 'ALL4',
+                    'CNS', 'Colon', 'DLBCL', 'Gastric', 'Gastric1', 'Gastric2',
+                    'Leukaemia', 'Lymphoma', 'MLL', 'Myeloma', 'Prostate',
+                    'SRBCT', 'Stroke', 'T1D']
     num_run = 10
-    problems = ['Adenoma', 'ALL_AML', 'ALL3', 'ALL4', 'CNS', 'Colon', 'DLBCL', 'Gastric',
-               'Leukemia', 'Lymphoma', 'Prostate', 'Stroke']
 
     for i in range(num_run):
         for p_name in problems:
-            results = Training_EMDO(p_name, i)
+            results = Training_EMDO(p_name, i, data_dir=data_dir)
             results['p_name'] = p_name
             saveResults_EMDO(results)
 
