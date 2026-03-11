@@ -140,39 +140,78 @@ def emdo_environmental_selection(pool_fit, nhd_matrix, N, alpha_cd):
 
 # ── 4. Surrogate-Assisted Evaluation Helpers ─────────────────────────────────
 def build_surrogate(archive_X, archive_y):
-    """Train and return a RandomForestRegressor on the archive."""
-    model = RandomForestRegressor(n_estimators=50, random_state=0, n_jobs=-1)
+    """
+    Train a RandomForestRegressor on the archive.
+    Returns the trained surrogate model.
+    """
+    model = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
     model.fit(archive_X, archive_y)
     return model
 
-def surrogate_assisted_pool_eval(pool_bin, feat, label, opts, surrogate, archive_X, archive_y, k_real):
+def surrogate_predict_with_uncertainty(surrogate, pool_bin):
     """
-    Evaluate pool_bin using surrogate + selective true evaluation.
+    Predict fitness for pool_bin candidates using surrogate.
+    Also return per-candidate uncertainty (std across RF trees).
 
-    For candidates not selected for true eval, their surrogate-predicted
-    fitness is used instead of the expensive KNN fitness.
+    Returns:
+        pred_mean  : shape (pool_size,) — predicted fitness (mean across trees)
+        pred_std   : shape (pool_size,) — uncertainty (std across trees)
+    """
+    tree_preds = np.array([tree.predict(pool_bin) for tree in surrogate.estimators_])
+    pred_mean = tree_preds.mean(axis=0)
+    pred_std  = tree_preds.std(axis=0)
+    return pred_mean, pred_std
 
-    Returns: pool_fit (array), updated archive_X, updated archive_y, n_true_evals (int)
+def infill_sampling(pred_mean, pred_std, k_exploit, k_explore):
+    """
+    Infill Sampling Strategy (EI-like):
+    - Select k_exploit candidates with lowest predicted fitness (exploitation)
+    - Select k_explore candidates with highest uncertainty (exploration)
+    - Return union of both sets as indices for true evaluation.
+
+    This prevents the surrogate from developing systematic bias by always
+    including the most uncertain candidates for real evaluation.
+    """
+    exploit_idx = np.argsort(pred_mean)[:k_exploit]
+    explore_idx = np.argsort(-pred_std)[:k_explore]
+    real_eval_idx = np.union1d(exploit_idx, explore_idx)
+    return real_eval_idx
+
+def surrogate_assisted_pool_eval(pool_bin, feat, label, opts, surrogate, archive_X, archive_y, k_exploit, k_explore):
+    """
+    Evaluate pool_bin using surrogate + infill sampling.
+
+    Steps:
+    1. Predict fitness + uncertainty for all candidates using surrogate
+    2. Select real_eval_idx = union(top-k_exploit by pred_mean, top-k_explore by pred_std)
+    3. Evaluate real_eval_idx candidates with true KNN fitness
+    4. For remaining candidates, use pred_mean as their fitness
+    5. Add newly evaluated (mask, fitness) pairs to archive
+
+    Returns:
+        pool_fit      : array of shape (pool_size,) — true or surrogate fitness
+        archive_X     : updated archive inputs
+        archive_y     : updated archive fitness values
+        n_true_evals  : number of true KNN evaluations performed this call
     """
     fun = jFitnessFunction
-    pool_size = len(pool_bin)
-    pred_fit = surrogate.predict(pool_bin.astype(float))
 
-    # Select top-k (lowest predicted cost) for true evaluation
-    top_k_idx = np.argsort(pred_fit)[:k_real]
-    pool_fit = pred_fit.copy()
+    pred_mean, pred_std = surrogate_predict_with_uncertainty(surrogate, pool_bin)
+    real_eval_idx = infill_sampling(pred_mean, pred_std, k_exploit, k_explore)
 
-    # True evaluate only the selected candidates
-    for i in top_k_idx:
-        pool_fit[i] = fun(feat, label, pool_bin[i].astype(bool), opts)
+    pool_fit = pred_mean.copy()
+    new_X, new_y = [], []
+    for i in real_eval_idx:
+        true_fit = fun(feat, label, pool_bin[i].astype(bool), opts)
+        pool_fit[i] = true_fit
+        new_X.append(pool_bin[i])
+        new_y.append(true_fit)
 
-    # Update archive with newly true-evaluated pairs
-    new_X = pool_bin[top_k_idx].astype(float)
-    new_y = pool_fit[top_k_idx]
-    archive_X = np.vstack([archive_X, new_X])
-    archive_y = np.concatenate([archive_y, new_y])
+    if new_X:
+        archive_X = np.vstack([archive_X, np.array(new_X)])
+        archive_y = np.concatenate([archive_y, np.array(new_y)])
 
-    return pool_fit, archive_X, archive_y, len(top_k_idx)
+    return pool_fit, archive_X, archive_y, len(real_eval_idx)
 
 # ── 5. Main Algorithm: Knowledge-Guided Adaptive Dual-Space MOEA ───────────
 def jMultiTaskPSO_KGEF(feat, label, opts):
@@ -186,12 +225,12 @@ def jMultiTaskPSO_KGEF(feat, label, opts):
 
     # Surrogate options
     use_surrogate = opts.get('use_surrogate', True)
-    k_real_ratio = opts.get('k_real_ratio', 0.6)
-    min_archive = opts.get('min_archive', None)
-    if min_archive is None:
-        min_archive = 2 * N
+    k_exploit_ratio = opts.get('k_exploit_ratio', 0.5)
+    k_explore_ratio = opts.get('k_explore_ratio', 0.2)
+    k_exploit = max(1, int(k_exploit_ratio * 2 * N))
+    k_explore = max(1, int(k_explore_ratio * 2 * N))
+    min_archive = opts.get('min_archive', 2 * N)
     retrain_interval = opts.get('retrain_interval', 5)
-    k_real = max(N, int(k_real_ratio * 2 * N))
     
     weight = np.zeros(dim)
     X = np.random.uniform(lb, ub, (N, dim))
@@ -218,12 +257,11 @@ def jMultiTaskPSO_KGEF(feat, label, opts):
     curve[0] = fitG
     fnum[0] = np.sum(Xgb > thres)
 
-    # Surrogate archive: seed with initial population evaluations
-    archive_X = X.astype(float).copy()
+    # Surrogate archive: collect all initialization evaluations
+    archive_X = (X > thres).astype(int).copy()  # binary masks from initialization
     archive_y = fit.copy()
     surrogate = None
-    total_true_evals = N  # N true evaluations performed during initial population setup
-    last_retrain_iter = 0
+    total_true_evals = N  # initialization already used N true evals
 
     t = 1
     while t <= max_Iter:
@@ -231,6 +269,9 @@ def jMultiTaskPSO_KGEF(feat, label, opts):
         # 前期 alpha_cd 接近 0 (彻底铺开找结构差异)
         # 后期 alpha_cd 接近 1 (专注 Pareto 前沿开发收敛)
         alpha_cd = (t / max_Iter) ** 2
+
+        # Adaptive Memory with Forgetting: exponential decay prevents weight saturation
+        weight *= opts.get('weight_decay', 0.99)
 
         # 阶段 1：子种群生成
         X_new = X.copy()
@@ -251,33 +292,29 @@ def jMultiTaskPSO_KGEF(feat, label, opts):
                     else:
                         X_new[i, d] = 0
 
-        # 阶段 2：EMDO 环境选择 (使用纯矩阵化 NHD)
+        # [STAGE 2: Pool Evaluation — Surrogate-Assisted or Full]
         pool_X = np.vstack([Xpb, X_new])
         pool_bin = (pool_X > thres).astype(int)
 
-        # Surrogate-assisted evaluation or full true evaluation
-        # When surrogate is ready (archive large enough), use it to pre-screen candidates.
-        # Otherwise (cold start or surrogate not yet built), fall back to full true evaluation.
         if use_surrogate and surrogate is not None and len(archive_y) >= min_archive:
-            pool_fit, archive_X, archive_y, n_true = surrogate_assisted_pool_eval(
-                pool_bin, feat, label, opts, surrogate, archive_X, archive_y, k_real
+            pool_fit, archive_X, archive_y, n_evals = surrogate_assisted_pool_eval(
+                pool_bin, feat, label, opts, surrogate,
+                archive_X, archive_y, k_exploit, k_explore
             )
-            total_true_evals += n_true
+            total_true_evals += n_evals
             # Retrain surrogate periodically
-            if t - last_retrain_iter >= retrain_interval:
+            if t % retrain_interval == 0:
                 surrogate = build_surrogate(archive_X, archive_y)
-                last_retrain_iter = t
         else:
             # Cold start: full true evaluation
             pool_fit = np.array([fun(feat, label, pool_bin[i].astype(bool), opts) for i in range(2 * N)])
-            total_true_evals += 2 * N
-            # Update archive
-            archive_X = np.vstack([archive_X, pool_bin.astype(float)])
+            # Add to archive
+            archive_X = np.vstack([archive_X, pool_bin])
             archive_y = np.concatenate([archive_y, pool_fit])
+            total_true_evals += 2 * N
             # Train surrogate once archive is large enough
             if use_surrogate and len(archive_y) >= min_archive and surrogate is None:
                 surrogate = build_surrogate(archive_X, archive_y)
-                last_retrain_iter = t
         
         nhd_matrix = pairwise_normalized_hamming_distance(pool_bin)
         selected = emdo_environmental_selection(pool_fit, nhd_matrix, N, alpha_cd)
@@ -384,7 +421,15 @@ def Training_KGEF(p_name, i, data_dir=DATA_DIR):
     feat = traindata[:, :-1]
     label = traindata[:, -1]
 
-    opts = {'k': 3, 'N': 20, 'T': 100, 'thres': 0.6, 'use_surrogate': True}
+    opts = {
+        'k': 3, 'N': 20, 'T': 100, 'thres': 0.6,
+        'weight_decay': 0.99,
+        'use_surrogate': True,
+        'k_exploit_ratio': 0.5,
+        'k_explore_ratio': 0.2,
+        'min_archive': 40,
+        'retrain_interval': 5,
+    }
     PSO = jMultiTaskPSO_KGEF(feat, label, opts)
     
     # 结果保存
