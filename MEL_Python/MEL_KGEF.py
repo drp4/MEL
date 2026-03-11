@@ -3,6 +3,7 @@ import math
 import numpy as np
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.model_selection import KFold
+from sklearn.ensemble import RandomForestRegressor
 from time import time
 import csv
 
@@ -137,7 +138,43 @@ def emdo_environmental_selection(pool_fit, nhd_matrix, N, alpha_cd):
 
     return np.array(selected)
 
-# ── 4. Main Algorithm: Knowledge-Guided Adaptive Dual-Space MOEA ───────────
+# ── 4. Surrogate-Assisted Evaluation Helpers ─────────────────────────────────
+def build_surrogate(archive_X, archive_y):
+    """Train and return a RandomForestRegressor on the archive."""
+    model = RandomForestRegressor(n_estimators=50, random_state=0, n_jobs=-1)
+    model.fit(archive_X, archive_y)
+    return model
+
+def surrogate_assisted_pool_eval(pool_bin, feat, label, opts, surrogate, archive_X, archive_y, k_real):
+    """
+    Evaluate pool_bin using surrogate + selective true evaluation.
+
+    For candidates not selected for true eval, their surrogate-predicted
+    fitness is used instead of the expensive KNN fitness.
+
+    Returns: pool_fit (array), updated archive_X, updated archive_y, n_true_evals (int)
+    """
+    fun = jFitnessFunction
+    pool_size = len(pool_bin)
+    pred_fit = surrogate.predict(pool_bin.astype(float))
+
+    # Select top-k (lowest predicted cost) for true evaluation
+    top_k_idx = np.argsort(pred_fit)[:k_real]
+    pool_fit = pred_fit.copy()
+
+    # True evaluate only the selected candidates
+    for i in top_k_idx:
+        pool_fit[i] = fun(feat, label, pool_bin[i].astype(bool), opts)
+
+    # Update archive with newly true-evaluated pairs
+    new_X = pool_bin[top_k_idx].astype(float)
+    new_y = pool_fit[top_k_idx]
+    archive_X = np.vstack([archive_X, new_X])
+    archive_y = np.concatenate([archive_y, new_y])
+
+    return pool_fit, archive_X, archive_y, len(top_k_idx)
+
+# ── 5. Main Algorithm: Knowledge-Guided Adaptive Dual-Space MOEA ───────────
 def jMultiTaskPSO_KGEF(feat, label, opts):
     lb, ub, thres = 0, 1, 0.5
     c1, c2, c3, w = 2, 2, 2, 0.9
@@ -146,6 +183,15 @@ def jMultiTaskPSO_KGEF(feat, label, opts):
     max_Iter = opts.get('T', 100)
     dim = feat.shape[1]
     fun = jFitnessFunction
+
+    # Surrogate options
+    use_surrogate = opts.get('use_surrogate', True)
+    k_real_ratio = opts.get('k_real_ratio', 0.6)
+    min_archive = opts.get('min_archive', None)
+    if min_archive is None:
+        min_archive = 2 * N
+    retrain_interval = opts.get('retrain_interval', 5)
+    k_real = max(N, int(k_real_ratio * 2 * N))
     
     weight = np.zeros(dim)
     X = np.random.uniform(lb, ub, (N, dim))
@@ -171,6 +217,13 @@ def jMultiTaskPSO_KGEF(feat, label, opts):
     curve, fnum, nhd_curve = np.zeros(max_Iter + 1), np.zeros(max_Iter + 1), np.zeros(max_Iter + 1)
     curve[0] = fitG
     fnum[0] = np.sum(Xgb > thres)
+
+    # Surrogate archive: seed with initial population evaluations
+    archive_X = X.astype(float).copy()
+    archive_y = fit.copy()
+    surrogate = None
+    total_true_evals = N  # N true evaluations performed during initial population setup
+    last_retrain_iter = 0
 
     t = 1
     while t <= max_Iter:
@@ -201,7 +254,30 @@ def jMultiTaskPSO_KGEF(feat, label, opts):
         # 阶段 2：EMDO 环境选择 (使用纯矩阵化 NHD)
         pool_X = np.vstack([Xpb, X_new])
         pool_bin = (pool_X > thres).astype(int)
-        pool_fit = np.array([fun(feat, label, pool_bin[i].astype(bool), opts) for i in range(2 * N)])
+
+        # Surrogate-assisted evaluation or full true evaluation
+        # When surrogate is ready (archive large enough), use it to pre-screen candidates.
+        # Otherwise (cold start or surrogate not yet built), fall back to full true evaluation.
+        if use_surrogate and surrogate is not None and len(archive_y) >= min_archive:
+            pool_fit, archive_X, archive_y, n_true = surrogate_assisted_pool_eval(
+                pool_bin, feat, label, opts, surrogate, archive_X, archive_y, k_real
+            )
+            total_true_evals += n_true
+            # Retrain surrogate periodically
+            if t - last_retrain_iter >= retrain_interval:
+                surrogate = build_surrogate(archive_X, archive_y)
+                last_retrain_iter = t
+        else:
+            # Cold start: full true evaluation
+            pool_fit = np.array([fun(feat, label, pool_bin[i].astype(bool), opts) for i in range(2 * N)])
+            total_true_evals += 2 * N
+            # Update archive
+            archive_X = np.vstack([archive_X, pool_bin.astype(float)])
+            archive_y = np.concatenate([archive_y, pool_fit])
+            # Train surrogate once archive is large enough
+            if use_surrogate and len(archive_y) >= min_archive and surrogate is None:
+                surrogate = build_surrogate(archive_X, archive_y)
+                last_retrain_iter = t
         
         nhd_matrix = pairwise_normalized_hamming_distance(pool_bin)
         selected = emdo_environmental_selection(pool_fit, nhd_matrix, N, alpha_cd)
@@ -226,8 +302,9 @@ def jMultiTaskPSO_KGEF(feat, label, opts):
                 weight[change & (fv_o < fv_n)] += dec
 
         X = X_surv.copy()
+        improved = fit_surv < fitP
         fitP = np.minimum(fit_surv, fitP)
-        Xpb = np.where((fit_surv < fitP)[:, np.newaxis], X_surv, Xpb)
+        Xpb = np.where(improved[:, np.newaxis], X_surv, Xpb)
 
         # 【核心创新 3】：基于知识引导的精英微调 (Knowledge-Guided Elite Fine-tuning, KGEF)
         # 替代耗时且盲目的 Levy 飞行
@@ -292,7 +369,7 @@ def jMultiTaskPSO_KGEF(feat, label, opts):
     Sf = Pos[Xgb > thres]
     sFeat = feat[:, Sf]
 
-    return {'curve': curve, 'fnum': fnum, 'fitG': fitG, 'nhd_curve': nhd_curve, 'nf': len(Sf), 'sf': Sf, 'ff': sFeat}
+    return {'curve': curve, 'fnum': fnum, 'fitG': fitG, 'nhd_curve': nhd_curve, 'nf': len(Sf), 'sf': Sf, 'ff': sFeat, 'true_eval_count': total_true_evals}
 
 # ── 5. Run & Save ──────────────────────────────────────────────────────────
 def Training_KGEF(p_name, i, data_dir=DATA_DIR):
@@ -307,7 +384,7 @@ def Training_KGEF(p_name, i, data_dir=DATA_DIR):
     feat = traindata[:, :-1]
     label = traindata[:, -1]
 
-    opts = {'k': 3, 'N': 20, 'T': 100, 'thres': 0.6}
+    opts = {'k': 3, 'N': 20, 'T': 100, 'thres': 0.6, 'use_surrogate': True}
     PSO = jMultiTaskPSO_KGEF(feat, label, opts)
     
     # 结果保存
@@ -319,6 +396,7 @@ def Training_KGEF(p_name, i, data_dir=DATA_DIR):
         'optimized_Accuracy': 1 - PSO['fitG'],
         'selected_Features': PSO['nf'],
         'avg_nhd': np.mean(PSO['nhd_curve'][1:]) if len(PSO['nhd_curve']) > 1 else 0.0,
+        'true_eval_count': PSO['true_eval_count'],
         'time': f"{time() - start_time:.2f}"
     }
     return results
@@ -330,7 +408,7 @@ def main():
 
     file_path = 'results_kgef_eswa.csv'
     with open(file_path, 'w', newline='') as f:
-        csv.DictWriter(f, fieldnames=['Data Set', 'Avg Accuracy', 'Selected Features', 'Avg NHD', 'Running Time']).writeheader()
+        csv.DictWriter(f, fieldnames=['Data Set', 'Avg Accuracy', 'Selected Features', 'Avg NHD', 'True Evals', 'Running Time']).writeheader()
 
     for i in range(num_run):
         for p_name in problems:
@@ -338,9 +416,10 @@ def main():
             res = Training_KGEF(p_name, i)
             res['p_name'] = p_name
             with open(file_path, 'a', newline='') as f:
-                csv.DictWriter(f, fieldnames=['Data Set', 'Avg Accuracy', 'Selected Features', 'Avg NHD', 'Running Time']).writerow({
+                csv.DictWriter(f, fieldnames=['Data Set', 'Avg Accuracy', 'Selected Features', 'Avg NHD', 'True Evals', 'Running Time']).writerow({
                     'Data Set': res['p_name'], 'Avg Accuracy': res['optimized_Accuracy'], 
-                    'Selected Features': res['selected_Features'], 'Avg NHD': res['avg_nhd'], 'Running Time': res['time']
+                    'Selected Features': res['selected_Features'], 'Avg NHD': res['avg_nhd'],
+                    'True Evals': res['true_eval_count'], 'Running Time': res['time']
                 })
 
 if __name__ == "__main__":
