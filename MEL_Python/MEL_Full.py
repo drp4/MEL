@@ -295,8 +295,9 @@ def jMultiTaskPSO_Full(feat, label, opts):
                 for jj in np.where(change & (fv_o < fv_n))[0]: weight[jj] += decrease_acc
 
         X = X_surv.copy()
+        improved = fit_surv < fitP
         fitP = np.minimum(fit_surv, fitP)
-        Xpb = np.where((fit_surv < fitP)[:, np.newaxis], X_surv, Xpb)
+        Xpb = np.where(improved[:, np.newaxis], X_surv, Xpb)
 
 
         # [STAGE 3: Elite Levy-flight Fine-tuning (NEW!)]
